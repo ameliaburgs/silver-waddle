@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Published Google Sheet → HTML table</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --bg:#f7f9fc; --card:#fff; --accent:#0366d6; --muted:#666; --border:#e6eef8; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:var(--bg); margin:0; padding:24px; color:#111; }
+    .card { background:var(--card); border-radius:10px; max-width:1100px; margin:0 auto; padding:18px; box-shadow: 0 6px 30px rgba(20,30,50,0.06); }
+    h1 { margin:0 0 8px 0; font-size:18px; }
+    .muted { color:var(--muted); font-size:13px; margin-bottom:12px; }
+    .controls { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; align-items:center; }
+    .controls button { background:var(--accent); color:#fff; border:0; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
+    .controls button[disabled] { opacity:.6; cursor:default; }
+    .url { font-size:13px; color:#0b3a66; word-break:break-all; }
+    .status { margin-top:8px; font-size:13px; color:var(--muted); }
+    table { width:100%; border-collapse:collapse; margin-top:16px; background:#fff; }
+    th, td { padding:8px 10px; border:1px solid var(--border); text-align:left; vertical-align:top; font-size:14px; }
+    th { background:#f1f8ff; color:#0b3a66; font-weight:700; position:sticky; top:0; z-index:1; }
+    tbody tr:nth-child(odd) td { background:#fcfeff; }
+    .error { color:#b91c1c; margin-top:10px; }
+    .actions { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }
+    .small { font-size:13px; color:var(--muted); }
+    pre { background:#f6f8fa; padding:10px; border-radius:6px; overflow:auto; max-height:280px; }
+  </style>
+</head>
+<body>
+  <div class="card" id="app">
+    <h1>Rendered Google Sheet → HTML table</h1>
+    <div class="muted">This page fetches the published CSV for the sheet you provided and converts it to a semantic HTML table.</div>
+
+    <div>
+      <div><strong>Source CSV URL</strong></div>
+      <div class="url" id="csvUrl">https://docs.google.com/spreadsheets/d/e/2PACX-1vRwIBY_C5D-OOfPgzXzkeku-miX5oGNFwkqvgn8GQRAfYkqwEr5UfnYrjvh_e-a6Q/pub?gid=653863508&single=true&output=csv</div>
+    </div>
+
+    <div class="controls" style="margin-top:10px;">
+      <button id="loadBtn">Load table now</button>
+      <button id="downloadHtmlBtn" disabled>Download table as HTML</button>
+      <button id="copyHtmlBtn" disabled>Copy table HTML</button>
+      <button id="downloadCsvBtn">Download CSV</button>
+      <label style="margin-left:6px;" class="small"><input id="hasHeader" type="checkbox" checked /> First row is header</label>
+    </div>
+
+    <div id="status" class="status">Ready. Click "Load table now" to fetch and render the sheet.</div>
+    <div id="error" class="error" role="alert" aria-live="polite"></div>
+
+    <div id="tableContainer" aria-live="polite"></div>
+
+    <div class="actions">
+      <div class="small">Tip: the sheet must be publicly published (you provided a published CSV URL, so this should work). If you want sorting, pagination, or styling tweaks I can add them.</div>
+    </div>
+
+    <div id="raw" style="margin-top:12px;"></div>
+  </div>
+
+<script>
+(function () {
+  const CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRwIBY_C5D-OOfPgzXzkeku-miX5oGNFwkqvgn8GQRAfYkqwEr5UfnYrjvh_e-a6Q/pub?gid=653863508&single=true&output=csv';
+  const loadBtn = document.getElementById('loadBtn');
+  const downloadHtmlBtn = document.getElementById('downloadHtmlBtn');
+  const copyHtmlBtn = document.getElementById('copyHtmlBtn');
+  const downloadCsvBtn = document.getElementById('downloadCsvBtn');
+  const status = document.getElementById('status');
+  const errorEl = document.getElementById('error');
+  const tableContainer = document.getElementById('tableContainer');
+  const raw = document.getElementById('raw');
+  const hasHeaderCheckbox = document.getElementById('hasHeader');
+
+  // Simple but robust CSV parser (handles quoted fields and doubled quotes)
+  function parseCSV(text, delimiter=',') {
+    const rows = [];
+    let cur = '';
+    let row = [];
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inQuotes) {
+        if (ch === '"') {
+          // double quote => escaped quote if next char is also "
+          if (text[i+1] === '"') {
+            cur += '"';
+            i++;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          cur += ch;
+        }
+      } else {
+        if (ch === '"') {
+          inQuotes = true;
+        } else if (ch === delimiter) {
+          row.push(cur);
+          cur = '';
+        } else if (ch === '\r') {
+          // skip, we'll handle \n
+        } else if (ch === '\n') {
+          row.push(cur);
+          rows.push(row);
+          row = [];
+          cur = '';
+        } else {
+          cur += ch;
+        }
+      }
+    }
+    // push last
+    if (cur !== '' || row.length > 0) {
+      row.push(cur);
+      rows.push(row);
+    }
+    // Normalize: ensure each row has same number of columns (use empty strings)
+    const maxCols = rows.reduce((m, r) => Math.max(m, r.length), 0);
+    return rows.map(r => {
+      if (r.length < maxCols) {
+        return r.concat(Array(maxCols - r.length).fill(''));
+      }
+      return r;
+    });
+  }
+
+  function buildTable(rows, header=true) {
+    const table = document.createElement('table');
+    if (!rows || rows.length === 0) return table;
+    const thead = document.createElement('thead');
+    const tbody = document.createElement('tbody');
+    let startRow = 0;
+    if (header) {
+      const tr = document.createElement('tr');
+      rows[0].forEach(h => {
+        const th = document.createElement('th');
+        th.textContent = h != null ? String(h) : '';
+        tr.appendChild(th);
+      });
+      thead.appendChild(tr);
+      startRow = 1;
+    } else {
+      // create placeholder headers if none
+      const trh = document.createElement('tr');
+      rows[0].forEach((_, i) => {
+        const th = document.createElement('th');
+        th.textContent = 'Column ' + (i + 1);
+        trh.appendChild(th);
+      });
+      thead.appendChild(trh);
+    }
+
+    for (let r = startRow; r < rows.length; r++) {
+      const tr = document.createElement('tr');
+      rows[r].forEach(cell => {
+        const td = document.createElement('td');
+        // Preserve newlines in cells
+        if (typeof cell === 'string' && cell.indexOf('\n') !== -1) {
+          const parts = cell.split('\n');
+          parts.forEach((p, idx) => {
+            td.appendChild(document.createTextNode(p));
+            if (idx < parts.length - 1) td.appendChild(document.createElement('br'));
+          });
+        } else {
+          td.textContent = cell == null ? '' : String(cell);
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    }
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    return table;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, function(m) {
+      return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m];
+    });
+  }
+
+  function tableToStandaloneHtml(tableEl, title = 'Sheet as HTML table') {
+    const style = document.querySelector('style').textContent;
+    return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>${escapeHtml(title)}</title>
+<style>${style}</style>
+</head>
+<body>
+<div class="card">
+<h1>${escapeHtml(title)}</h1>
+${tableEl.outerHTML}
+</div>
+</body>
+</html>`;
+  }
+
+  async function fetchCsvAndRender() {
+    errorEl.textContent = '';
+    status.textContent = 'Fetching CSV…';
+    loadBtn.disabled = true;
+    try {
+      const resp = await fetch(CSV_URL, { mode: 'cors' });
+      if (!resp.ok) throw new Error('Network error: ' + resp.status + ' ' + resp.statusText);
+      const text = await resp.text();
+      status.textContent = 'Parsing CSV…';
+      const rows = parseCSV(text);
+      if (!rows || rows.length === 0) {
+        throw new Error('CSV appears empty or could not be parsed.');
+      }
+      const header = hasHeaderCheckbox.checked;
+      const tableEl = buildTable(rows, header);
+      tableContainer.innerHTML = '';
+      tableContainer.appendChild(tableEl);
+      raw.innerHTML = '<div class="small">First 1000 characters of CSV source (for debugging):</div><pre>' + escapeHtml(text.slice(0,1000)) + (text.length > 1000 ? '\n\n...truncated...' : '') + '</pre>';
+      status.textContent = 'Loaded table — ' + (rows.length - (header ? 1 : 0)) + ' data rows.';
+      // enable download/copy
+      downloadHtmlBtn.disabled = false;
+      copyHtmlBtn.disabled = false;
+    } catch (err) {
+      console.error(err);
+      errorEl.textContent = 'Error: ' + (err.message || err);
+      status.textContent = 'Failed to load.';
+    } finally {
+      loadBtn.disabled = false;
+    }
+  }
+
+  loadBtn.addEventListener('click', fetchCsvAndRender);
+
+  downloadHtmlBtn.addEventListener('click', () => {
+    const tbl = tableContainer.querySelector('table');
+    if (!tbl) return;
+    const html = tableToStandaloneHtml(tbl, 'Google Sheet (exported)');
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'sheet-table.html';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  copyHtmlBtn.addEventListener('click', async () => {
+    const tbl = tableContainer.querySelector('table');
+    if (!tbl) return;
+    const html = tableToStandaloneHtml(tbl, 'Google Sheet (exported)');
+    try {
+      await navigator.clipboard.writeText(html);
+      status.textContent = 'HTML copied to clipboard.';
+    } catch (e) {
+      status.textContent = 'Copy failed — you can download instead.';
+    }
+  });
+
+  downloadCsvBtn.addEventListener('click', () => {
+    const a = document.createElement('a');
+    a.href = CSV_URL;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+  // Auto-load on open
+  window.addEventListener('DOMContentLoaded', () => {
+    // small delay so user sees UI
+    setTimeout(() => loadBtn.click(), 350);
+  });
+
+})();
+</script>
+</body>
+</html>
