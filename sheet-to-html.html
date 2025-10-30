@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Google Sheet → HTML Table</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; padding: 24px; background:#f7f9fc; color:#111; }
+    .card { background:#fff; border-radius:8px; padding:18px; box-shadow: 0 2px 8px rgba(20,30,50,0.06); max-width:1000px; margin:0 auto; }
+    label { display:block; font-size:13px; margin-top:12px; color:#333; }
+    input[type="text"] { width:100%; padding:8px 10px; font-size:14px; margin-top:6px; box-sizing:border-box; }
+    button { margin-top:12px; padding:10px 14px; border:0; background:#0366d6; color:#fff; font-weight:600; border-radius:6px; cursor:pointer; }
+    button[disabled] { opacity:0.6; cursor:default; }
+    table { width:100%; border-collapse:collapse; margin-top:18px; }
+    th, td { padding:8px 10px; border:1px solid #e6eef8; text-align:left; vertical-align:top; }
+    th { background:#f1f8ff; font-weight:700; color:#0b3a66; }
+    pre { white-space:pre-wrap; word-break:break-word; background:#f6f8fa; padding:10px; border-radius:6px; }
+    .hint { font-size:13px; color:#555; margin-top:8px; }
+    .error { color:#b91c1c; margin-top:12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Convert Google Sheet to HTML table</h2>
+
+    <div class="hint">
+      Steps: 1) In Google Sheets choose File → Publish to the web (choose the sheet or entire doc). 2) Copy the sheet ID from the sheet URL: the long string between "/d/" and "/edit". 3) Enter the Sheet ID below and optionally the sheet name (or leave blank to use the first sheet).
+    </div>
+
+    <label for="sheetId">Google Sheet ID</label>
+    <input id="sheetId" type="text" placeholder="e.g. 1A2bC3dEFgHIjKlmNOPq_rsTUVwxYz" />
+
+    <label for="sheetName">Sheet name (optional)</label>
+    <input id="sheetName" type="text" placeholder="e.g. Sheet1 (or leave blank)" />
+
+    <label for="useGid">Or supply gid (optional)</label>
+    <input id="gid" type="text" placeholder="Optional: gid number (e.g. 0)" />
+
+    <button id="loadBtn">Load table</button>
+    <div id="status" class="hint" aria-live="polite"></div>
+    <div id="error" class="error" role="alert"></div>
+
+    <div id="tableContainer"></div>
+    <div id="rawJson" style="margin-top:14px;"></div>
+  </div>
+
+<script>
+(function () {
+  const loadBtn = document.getElementById('loadBtn');
+  const status = document.getElementById('status');
+  const errorEl = document.getElementById('error');
+  const tableContainer = document.getElementById('tableContainer');
+  const rawJson = document.getElementById('rawJson');
+
+  function buildUrl(sheetId, sheetName, gid) {
+    // Use Google Visualization endpoint which returns a JSONP-like wrapper we will parse
+    // Example: https://docs.google.com/spreadsheets/d/{ID}/gviz/tq?tqx=out:json&sheet=Sheet1
+    const base = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(sheetId)}/gviz/tq?tqx=out:json`;
+    if (sheetName) return base + '&sheet=' + encodeURIComponent(sheetName);
+    if (gid) return base + '&gid=' + encodeURIComponent(gid);
+    return base;
+  }
+
+  function parseGvizText(text) {
+    // gviz returns something like: /*O_o*/\ngoogle.visualization.Query.setResponse({...});
+    // We extract the first "{" ... last "}" and parse.
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1) throw new Error('Unexpected gviz response format');
+    const jsonText = text.substring(start, end + 1);
+    return JSON.parse(jsonText);
+  }
+
+  function renderTableFromGviz(json) {
+    // json.table.cols -> array of { id, label, type }
+    // json.table.rows -> array of { c: [{v:...}, {v:...}] }
+    const cols = (json.table.cols || []).map(c => c.label || c.id || '');
+    const rows = (json.table.rows || []).map(r => (r.c || []).map(cell => cell ? (cell.v === null ? '' : cell.v) : ''));
+
+    // build table element
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const thr = document.createElement('tr');
+    cols.forEach(h => {
+      const th = document.createElement('th');
+      th.textContent = h || 'Column';
+      thr.appendChild(th);
+    });
+    thead.appendChild(thr);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    rows.forEach(r => {
+      const tr = document.createElement('tr');
+      cols.forEach((_, i) => {
+        const td = document.createElement('td');
+        const val = r[i];
+        // render booleans/numbers/dates as text
+        td.textContent = (typeof val === 'object' && val && val.formattedValue) ? val.formattedValue : (val == null ? '' : String(val));
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    return table;
+  }
+
+  loadBtn.addEventListener('click', async () => {
+    errorEl.textContent = '';
+    tableContainer.innerHTML = '';
+    rawJson.innerHTML = '';
+    status.textContent = 'Loading…';
+
+    const sheetId = document.getElementById('sheetId').value.trim();
+    const sheetName = document.getElementById('sheetName').value.trim();
+    const gid = document.getElementById('gid').value.trim();
+
+    if (!sheetId) {
+      errorEl.textContent = 'Please enter a Google Sheet ID.';
+      status.textContent = '';
+      return;
+    }
+
+    const url = buildUrl(sheetId, sheetName || null, gid || null);
+
+    try {
+      // fetch text then parse wrapper
+      const resp = await fetch(url, { mode: 'cors' });
+      if (!resp.ok) throw new Error('Network response was not ok: ' + resp.status);
+      const text = await resp.text();
+      const json = parseGvizText(text);
+      // optional: display raw JSON for debugging
+      rawJson.innerHTML = '<strong>Raw parsed JSON (truncated):</strong><pre>' + JSON.stringify(json, null, 2).slice(0, 4000) + (JSON.stringify(json, null, 2).length > 4000 ? '\n\n...truncated...' : '') + '</pre>';
+
+      const table = renderTableFromGviz(json);
+      tableContainer.appendChild(table);
+      status.textContent = 'Loaded table — showing ' + (json.table.rows ? json.table.rows.length : 0) + ' rows.';
+    } catch (err) {
+      console.error(err);
+      errorEl.textContent = 'Error: ' + (err.message || err);
+      status.textContent = '';
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
